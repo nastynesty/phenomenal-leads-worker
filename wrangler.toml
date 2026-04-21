@@ -1,0 +1,12 @@
+name = "phenomenal-leads"
+main = "src/worker.js"
+compatibility_date = "2026-04-21"
+account_id = "aacf45e3f36dbfc0695c96b9cdc7c7a0"
+
+[[kv_namespaces]]
+binding = "LEADS"
+id = "838a01842c6e4a7585413ad653f291a7"
+
+[vars]
+NOTIFY_EMAIL = "contact@916pools.com"
+FROM_EMAIL = "leads@quotrr.com"
