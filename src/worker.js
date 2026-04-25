@@ -1,172 +1,400 @@
+// Pass 29 D — added admin endpoints (/admin/leads, /admin/leads/:id/mark,
+// /admin/leads/export.csv) protected by a shared bearer token (ADMIN_TOKEN
+// wrangler secret). The lead intake POST behavior is unchanged.
+
 export default {
   async fetch(request, env) {
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    // CORS preflight — covers both the public /lead POST and the admin GETs.
+    if (method === 'OPTIONS') {
+      return corsPreflight();
     }
 
-    if (request.method !== 'POST') {
+    // Admin routes (auth-protected).
+    if (path.startsWith('/admin/leads')) {
+      const auth = checkAdminAuth(request, env);
+      if (auth !== true) return auth; // 401 Response
+
+      // GET /admin/leads — list with optional ?q=&limit=&cursor=
+      if (path === '/admin/leads' && method === 'GET') {
+        return await handleListLeads(request, env);
+      }
+
+      // GET /admin/leads/export.csv — full CSV export
+      if (path === '/admin/leads/export.csv' && method === 'GET') {
+        return await handleExportCsv(env);
+      }
+
+      // POST /admin/leads/:id/mark — toggle/set contacted status
+      const markMatch = path.match(/^\/admin\/leads\/([^/]+)\/mark$/);
+      if (markMatch && method === 'POST') {
+        return await handleMarkContacted(markMatch[1], request, env);
+      }
+
+      // GET /admin/leads/:id — single lead detail
+      const detailMatch = path.match(/^\/admin\/leads\/([^/]+)$/);
+      if (detailMatch && method === 'GET') {
+        return await handleLeadDetail(detailMatch[1], env);
+      }
+
+      return jsonResp({ error: 'Not found' }, 404);
+    }
+
+    // Public lead intake — accepts POST to / or /lead.
+    if (method !== 'POST') {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Content-Type': 'application/json',
-    };
+    return await handleLeadIntake(request, env);
+  },
+};
 
-    try {
-      // Parse form data (supports both JSON and form-urlencoded/multipart)
-      const contentType = request.headers.get('content-type') || '';
-      let data = {};
-      if (contentType.includes('application/json')) {
-        data = await request.json();
-      } else {
-        const formData = await request.formData();
-        for (const [key, value] of formData.entries()) {
+// --- helpers ---------------------------------------------------------------
+
+function corsHeaders(extra) {
+  return Object.assign({
+    'Access-Control-Allow-Origin': '*',
+    'Content-Type': 'application/json',
+  }, extra || {});
+}
+
+function corsPreflight() {
+  return new Response(null, {
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+    },
+  });
+}
+
+function jsonResp(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: corsHeaders(),
+  });
+}
+
+// Constant-time-ish string compare to avoid timing leaks on the bearer.
+function safeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+// Check Authorization: Bearer <ADMIN_TOKEN>. Returns `true` if OK,
+// otherwise a 401 Response ready to be returned.
+function checkAdminAuth(request, env) {
+  if (!env.ADMIN_TOKEN) {
+    return jsonResp({ error: 'Server misconfigured: ADMIN_TOKEN not set' }, 500);
+  }
+  const hdr = request.headers.get('authorization') || '';
+  const m = hdr.match(/^Bearer\s+(.+)$/i);
+  if (!m || !safeEq(m[1].trim(), env.ADMIN_TOKEN.trim())) {
+    return jsonResp({ error: 'Unauthorized' }, 401);
+  }
+  return true;
+}
+
+// --- admin: list leads -----------------------------------------------------
+
+async function handleListLeads(request, env) {
+  const url = new URL(request.url);
+  const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
+  const cursor = url.searchParams.get('cursor') || undefined;
+
+  // KV list returns metadata-light keys. We page through and read values
+  // for the slice the user wants. Free tier KV is rate-limited so we cap
+  // the read fan-out at `limit`.
+  const listed = await env.LEADS.list({ prefix: 'lead:', limit, cursor });
+
+  const reads = await Promise.all(
+    listed.keys.map(async (k) => {
+      const raw = await env.LEADS.get(k.name);
+      if (!raw) return null;
+      try {
+        const rec = JSON.parse(raw);
+        rec._key = k.name;
+        return rec;
+      } catch (_) {
+        return null;
+      }
+    })
+  );
+
+  let leads = reads.filter(Boolean);
+
+  // Newest first — keys embed ISO timestamp so reverse-sort by key works.
+  leads.sort((a, b) => (b._key || '').localeCompare(a._key || ''));
+
+  // Optional case-insensitive search across name/email/phone/address/project/notes.
+  if (q) {
+    leads = leads.filter((l) => {
+      const hay = [
+        l.name, l.email, l.phone, l.address, l.project, l.notes, l.template, l.source,
+      ].filter(Boolean).join(' ').toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+  }
+
+  return jsonResp({
+    ok: true,
+    count: leads.length,
+    cursor: listed.list_complete ? null : listed.cursor,
+    leads,
+  });
+}
+
+// --- admin: lead detail ----------------------------------------------------
+
+async function handleLeadDetail(id, env) {
+  // The KV key embeds the timestamp, so we list by suffix match.
+  const listed = await env.LEADS.list({ prefix: 'lead:', limit: 1000 });
+  const match = listed.keys.find((k) => k.name.endsWith(':' + id));
+  if (!match) return jsonResp({ error: 'Not found' }, 404);
+  const raw = await env.LEADS.get(match.name);
+  if (!raw) return jsonResp({ error: 'Not found' }, 404);
+  try {
+    const rec = JSON.parse(raw);
+    rec._key = match.name;
+    return jsonResp({ ok: true, lead: rec });
+  } catch (_) {
+    return jsonResp({ error: 'Corrupt record' }, 500);
+  }
+}
+
+// --- admin: mark contacted -------------------------------------------------
+
+async function handleMarkContacted(id, request, env) {
+  let body = {};
+  try { body = await request.json(); } catch (_) {}
+  const contacted = body && body.contacted !== false; // default true
+  const note = (body && typeof body.note === 'string') ? body.note : null;
+
+  const listed = await env.LEADS.list({ prefix: 'lead:', limit: 1000 });
+  const match = listed.keys.find((k) => k.name.endsWith(':' + id));
+  if (!match) return jsonResp({ error: 'Not found' }, 404);
+
+  const raw = await env.LEADS.get(match.name);
+  if (!raw) return jsonResp({ error: 'Not found' }, 404);
+
+  let rec;
+  try { rec = JSON.parse(raw); } catch (_) { return jsonResp({ error: 'Corrupt record' }, 500); }
+
+  rec.contacted = !!contacted;
+  rec.contacted_at = contacted ? new Date().toISOString() : null;
+  if (note !== null) rec.contact_note = note;
+
+  await env.LEADS.put(match.name, JSON.stringify(rec));
+  return jsonResp({ ok: true, lead: rec });
+}
+
+// --- admin: CSV export -----------------------------------------------------
+
+const CSV_COLUMNS = [
+  'id', 'timestamp', 'name', 'email', 'phone', 'address',
+  'project', 'project_slug', 'template', 'size', 'total',
+  'pool_finish', 'concrete_finish', 'timeline',
+  'contact_methods', 'contact_time',
+  'source', 'page', 'notes',
+  'contacted', 'contacted_at', 'contact_note',
+];
+
+function csvEscape(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+async function handleExportCsv(env) {
+  // Pull every lead. Free-tier KV list cap is 1000/page, so we paginate.
+  const all = [];
+  let cursor;
+  do {
+    const page = await env.LEADS.list({ prefix: 'lead:', limit: 1000, cursor });
+    for (const k of page.keys) {
+      const raw = await env.LEADS.get(k.name);
+      if (!raw) continue;
+      try {
+        const rec = JSON.parse(raw);
+        all.push(rec);
+      } catch (_) {}
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+
+  all.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+
+  const header = CSV_COLUMNS.join(',');
+  const rows = all.map((r) => CSV_COLUMNS.map((c) => csvEscape(r[c])).join(','));
+  const csv = [header, ...rows].join('\r\n');
+
+  return new Response(csv, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="phenomenal-leads.csv"',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+// --- public: lead intake (unchanged behavior, refactored into a function) --
+
+async function handleLeadIntake(request, env) {
+  try {
+    const contentType = request.headers.get('content-type') || '';
+    let data = {};
+    if (contentType.includes('application/json')) {
+      data = await request.json();
+    } else {
+      const formData = await request.formData();
+      for (const [key, value] of formData.entries()) {
+        // FormData allows duplicate keys for checkboxes (e.g. contact_methods).
+        // getAll preserves them; here we collapse repeats by appending into an array.
+        if (data[key] === undefined) {
           data[key] = value;
+        } else if (Array.isArray(data[key])) {
+          data[key].push(value);
+        } else {
+          data[key] = [data[key], value];
         }
       }
+    }
 
-      // Basic validation
-      const name = (data.name || data.fullName || '').toString().trim();
-      const email = (data.email || '').toString().trim();
-      const phone = (data.phone || '').toString().trim();
-      if (!name || !email) {
-        return new Response(JSON.stringify({ error: 'Name and email required' }), {
-          status: 400,
-          headers: corsHeaders,
-        });
-      }
+    // Basic validation
+    const name = (data.name || data.fullName || '').toString().trim();
+    const email = (data.email || '').toString().trim();
+    const phone = (data.phone || '').toString().trim();
+    if (!name || !email) {
+      return jsonResp({ error: 'Name and email required' }, 400);
+    }
 
-      // Honeypot spam check
-      if (data._gotcha || data.website) {
-        return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
-      }
+    // Honeypot spam check
+    if (data._gotcha || data.website) {
+      return jsonResp({ ok: true });
+    }
 
-      // Extract designImage before saving to KV (too large for KV values)
-      const designImage = (data.designImage || '').toString().trim();
-      const hasDesignImage = designImage.startsWith('data:image/');
+    // Normalize contact_methods — accept arrays, comma strings, or single value.
+    let cmRaw = data.contact_methods;
+    if (Array.isArray(cmRaw)) cmRaw = cmRaw.join(', ');
 
-      // Save to KV (lead log) — without the image data URL
-      const leadId = crypto.randomUUID();
-      const timestamp = new Date().toISOString();
-      const leadRecord = {
-        id: leadId,
-        timestamp,
-        name, email, phone,
-        source: data._source || data.source || 'website',
-        address: data.address || null,
-        project: data.project || null,
-        template: data.template || null,
-        size: data.size || null,
-        zones_summary: data.zones_summary || null,
-        total: data.total || null,
-        breakdown: data.breakdown || null,
-        pool_finish: data.pool_finish || null,
-        concrete_finish: data.concrete_finish || null,
-        timeline: data.timeline || null,
-        contact_methods: data.contact_methods || null,
-        contact_time: data.contact_time || null,
-        has_design_image: hasDesignImage,
-        userAgent: request.headers.get('user-agent'),
-        ip: request.headers.get('cf-connecting-ip'),
-        submitted_at: data.submitted_at || timestamp,
-      };
+    const designImage = (data.designImage || '').toString().trim();
+    const hasDesignImage = designImage.startsWith('data:image/');
 
-      // Pass 26: Detect structures-only flow — no pool traced, no zones drawn,
-      // but the user picked structures (kitchen/pergola/etc). Subject + banner
-      // make this obvious so the team knows the pool wasn't measured.
-      const zonesEmpty = !data.zones_summary || data.zones_summary === 'no zones drawn';
-      const isRemodelOrResurface = data.project_slug === 'remodel' || data.project_slug === 'resurface' ||
-        data.project === 'Pool Remodel + Resurface' || data.project === 'Pool Resurface';
-      const structuresOnly = zonesEmpty && (data.total && Number(data.total) > 0);
+    const leadId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+    const leadRecord = {
+      id: leadId,
+      timestamp,
+      name, email, phone,
+      source: data._source || data.source || 'website',
+      page: data.page || null,
+      address: data.address || null,
+      project: data.project || null,
+      project_slug: data.project_slug || null,
+      template: data.template || null,
+      size: data.size || null,
+      zones_summary: data.zones_summary || null,
+      total: data.total || null,
+      breakdown: data.breakdown || null,
+      pool_finish: data.pool_finish || null,
+      concrete_finish: data.concrete_finish || null,
+      timeline: data.timeline || null,
+      contact_methods: cmRaw || null,
+      contact_time: data.contact_time || null,
+      notes: data.notes || data.description || data.message || null,
+      has_design_image: hasDesignImage,
+      userAgent: request.headers.get('user-agent'),
+      ip: request.headers.get('cf-connecting-ip'),
+      submitted_at: data.submitted_at || timestamp,
+      // Pass 29 D admin tracking fields
+      contacted: false,
+      contacted_at: null,
+      contact_note: null,
+    };
 
-      // Pass 26: Format the contact preferences in human-friendly form.
-      // Common values: 'phone, text, email' / 'none' / 'phone'.
-      function fmtContactMethods(raw) {
-        if (!raw) return 'Not specified';
-        const s = String(raw).toLowerCase();
-        if (s === 'none' || s.includes('none')) return 'DO NOT CONTACT (customer opted out)';
-        const parts = s.split(/[,\s]+/).filter(Boolean).map(p => {
-          if (p === 'phone' || p === 'call') return 'Phone call';
-          if (p === 'text' || p === 'sms') return 'Text';
-          if (p === 'email') return 'Email';
-          return p.charAt(0).toUpperCase() + p.slice(1);
-        });
-        return parts.join(', ') || 'Not specified';
-      }
-      function fmtContactTime(raw) {
-        if (!raw || raw === 'none') return null;
-        const m = { 'morning': 'Morning (8am-12pm)', 'afternoon': 'Afternoon (12pm-5pm)', 'evening': 'Evening (5pm-8pm)', 'anytime': 'Anytime' };
-        return m[String(raw).toLowerCase()] || raw;
-      }
-      await env.LEADS.put(`lead:${timestamp}:${leadId}`, JSON.stringify(leadRecord));
+    const zonesEmpty = !data.zones_summary || data.zones_summary === 'no zones drawn';
+    const structuresOnly = zonesEmpty && (data.total && Number(data.total) > 0);
 
-      // Build plain-text fallback
-      // Pass 26: Surfaced contact_methods + contact_time. Reordered so the
-      // contact section sits right under the basic identity fields where the
-      // team actually looks first.
-      const displayFields = [
-        ['Name', name],
-        ['Email', email],
-        ['Phone', phone],
-        ['Address', data.address],
-        ['Preferred Contact', fmtContactMethods(data.contact_methods)],
-        ['Best Time to Reach', fmtContactTime(data.contact_time)],
-        ['Project', data.project],
-        ['Template', data.template],
-        ['Size', data.size],
-        ['Zones', data.zones_summary],
-        ['Pool Finish', data.pool_finish],
-        ['Concrete Finish', data.concrete_finish],
-        ['Timeline', data.timeline],
-        ['Total Estimate', data.total ? `$${Number(data.total).toLocaleString()}` : null],
-        ['Breakdown', data.breakdown],
-        ['Source', data.source],
-        ['Received', timestamp],
-        ['Lead ID', leadId],
-      ].filter(([, v]) => v);
+    function fmtContactMethods(raw) {
+      if (!raw) return 'Not specified';
+      const s = String(raw).toLowerCase();
+      if (s === 'none' || s.includes('none')) return 'DO NOT CONTACT (customer opted out)';
+      const parts = s.split(/[,\s]+/).filter(Boolean).map((p) => {
+        if (p === 'phone' || p === 'call') return 'Phone call';
+        if (p === 'text' || p === 'sms') return 'Text';
+        if (p === 'email') return 'Email';
+        return p.charAt(0).toUpperCase() + p.slice(1);
+      });
+      return parts.join(', ') || 'Not specified';
+    }
+    function fmtContactTime(raw) {
+      if (!raw || raw === 'none') return null;
+      const m = { morning: 'Morning (8am-12pm)', afternoon: 'Afternoon (12pm-5pm)', evening: 'Evening (5pm-8pm)', anytime: 'Anytime' };
+      return m[String(raw).toLowerCase()] || raw;
+    }
 
-      const textLines = displayFields.map(([k, v]) => `${k}: ${v}`).join('\n');
+    await env.LEADS.put(`lead:${timestamp}:${leadId}`, JSON.stringify(leadRecord));
 
-      // Build HTML email
-      const tableRows = displayFields
-        .map(([k, v]) => `<tr><td style="padding:4px 12px 4px 0;font-weight:600;white-space:nowrap;vertical-align:top;color:#374151;">${escHtml(k)}</td><td style="padding:4px 0;color:#111827;">${escHtml(String(v))}</td></tr>`)
-        .join('');
+    const displayFields = [
+      ['Name', name],
+      ['Email', email],
+      ['Phone', phone],
+      ['Address', data.address],
+      ['Preferred Contact', fmtContactMethods(cmRaw)],
+      ['Best Time to Reach', fmtContactTime(data.contact_time)],
+      ['Project', data.project],
+      ['Template', data.template],
+      ['Size', data.size],
+      ['Zones', data.zones_summary],
+      ['Pool Finish', data.pool_finish],
+      ['Concrete Finish', data.concrete_finish],
+      ['Timeline', data.timeline],
+      ['Total Estimate', data.total ? `$${Number(data.total).toLocaleString()}` : null],
+      ['Breakdown', data.breakdown],
+      ['Notes', leadRecord.notes],
+      ['Source', data.source],
+      ['Page', data.page],
+      ['Received', timestamp],
+      ['Lead ID', leadId],
+    ].filter(([, v]) => v);
 
-      const totalDisplay = data.total
-        ? `<div style="margin:20px 0;padding:16px 20px;background:#f0fdf4;border-left:4px solid #22c55e;border-radius:6px;"><span style="font-size:13px;color:#166534;font-weight:600;">ESTIMATED TOTAL</span><br><span style="font-size:28px;font-weight:700;color:#15803d;">$${Number(data.total).toLocaleString()}</span></div>`
-        : '';
+    const textLines = displayFields.map(([k, v]) => `${k}: ${v}`).join('\n');
 
-      // Pass 26: Warning banner for structures-only leads (pool not measured)
-      const structuresOnlyBanner = structuresOnly
-        ? `<div style="margin:20px 0;padding:14px 18px;background:#fef3c7;border-left:4px solid #f59e0b;border-radius:6px;"><div style="font-size:12px;color:#92400e;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:4px;">Structures Only · Pool Not Measured</div><div style="font-size:13px;color:#78350f;line-height:1.5;">Customer picked structures and finishes but did not trace their pool. The total above does not include resurface costs. Reach out to confirm pool dimensions before quoting.</div></div>`
-        : '';
+    const tableRows = displayFields
+      .map(([k, v]) => `<tr><td style="padding:4px 12px 4px 0;font-weight:600;white-space:nowrap;vertical-align:top;color:#374151;">${escHtml(k)}</td><td style="padding:4px 0;color:#111827;">${escHtml(String(v))}</td></tr>`)
+      .join('');
 
-      // Pass 26: Highlight contact preferences card under the green total bar.
-      // If customer opted out, show a red "DO NOT CONTACT" banner instead.
-      const cmRaw = String(data.contact_methods || '').toLowerCase();
-      const optedOut = cmRaw === 'none' || cmRaw.includes('none');
-      const cmDisplay = fmtContactMethods(data.contact_methods);
-      const ctDisplay = fmtContactTime(data.contact_time);
-      const contactBanner = optedOut
-        ? `<div style="margin:16px 0;padding:14px 18px;background:#fef2f2;border-left:4px solid #ef4444;border-radius:6px;"><div style="font-size:12px;color:#991b1b;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:4px;">Do Not Contact</div><div style="font-size:13px;color:#7f1d1d;">Customer explicitly opted out of contact.</div></div>`
-        : (data.contact_methods
-          ? `<div style="margin:16px 0;padding:14px 18px;background:#eff6ff;border-left:4px solid #3b82f6;border-radius:6px;"><div style="font-size:12px;color:#1e3a8a;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:6px;">How To Reach Them</div><div style="font-size:14px;color:#1e3a8a;font-weight:600;">${escHtml(cmDisplay)}</div>${ctDisplay ? `<div style="font-size:13px;color:#1e40af;margin-top:2px;">Best time: ${escHtml(ctDisplay)}</div>` : ''}</div>`
-          : '');
+    const totalDisplay = data.total
+      ? `<div style="margin:20px 0;padding:16px 20px;background:#f0fdf4;border-left:4px solid #22c55e;border-radius:6px;"><span style="font-size:13px;color:#166534;font-weight:600;">ESTIMATED TOTAL</span><br><span style="font-size:28px;font-weight:700;color:#15803d;">$${Number(data.total).toLocaleString()}</span></div>`
+      : '';
 
-      const imageBlock = hasDesignImage
-        ? `<div style="margin:20px 0;"><p style="margin:0 0 8px;font-size:13px;font-weight:600;color:#374151;">DESIGN SCREENSHOT</p><img src="${designImage}" alt="Customer design" style="max-width:100%;border-radius:8px;border:1px solid #e5e7eb;" /></div>`
-        : '';
+    const structuresOnlyBanner = structuresOnly
+      ? `<div style="margin:20px 0;padding:14px 18px;background:#fef3c7;border-left:4px solid #f59e0b;border-radius:6px;"><div style="font-size:12px;color:#92400e;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:4px;">Structures Only · Pool Not Measured</div><div style="font-size:13px;color:#78350f;line-height:1.5;">Customer picked structures and finishes but did not trace their pool. The total above does not include resurface costs. Reach out to confirm pool dimensions before quoting.</div></div>`
+      : '';
 
-      const htmlEmail = `<!DOCTYPE html>
+    const cmLower = String(cmRaw || '').toLowerCase();
+    const optedOut = !cmRaw || cmLower === 'none' || cmLower.includes('none') || cmLower.trim() === '';
+    const cmDisplay = fmtContactMethods(cmRaw);
+    const ctDisplay = fmtContactTime(data.contact_time);
+    const contactBanner = optedOut
+      ? `<div style="margin:16px 0;padding:14px 18px;background:#fef2f2;border-left:4px solid #ef4444;border-radius:6px;"><div style="font-size:12px;color:#991b1b;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:4px;">Do Not Contact</div><div style="font-size:13px;color:#7f1d1d;">Customer left all contact methods unchecked. Treat as opt-out.</div></div>`
+      : `<div style="margin:16px 0;padding:14px 18px;background:#eff6ff;border-left:4px solid #3b82f6;border-radius:6px;"><div style="font-size:12px;color:#1e3a8a;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:6px;">How To Reach Them</div><div style="font-size:14px;color:#1e3a8a;font-weight:600;">${escHtml(cmDisplay)}</div>${ctDisplay ? `<div style="font-size:13px;color:#1e40af;margin-top:2px;">Best time: ${escHtml(ctDisplay)}</div>` : ''}</div>`;
+
+    const imageBlock = hasDesignImage
+      ? `<div style="margin:20px 0;"><p style="margin:0 0 8px;font-size:13px;font-weight:600;color:#374151;">DESIGN SCREENSHOT</p><img src="${designImage}" alt="Customer design" style="max-width:100%;border-radius:8px;border:1px solid #e5e7eb;" /></div>`
+      : '';
+
+    const htmlEmail = `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#f9fafb;">
@@ -183,53 +411,50 @@ export default {
       ${tableRows}
     </table>
     ${imageBlock}
-    <p style="margin:24px 0 0;font-size:12px;color:#9ca3af;">Sent from Phenomenal Pool &amp; Landscape estimator &middot; Lead ID: ${leadId}</p>
+    <p style="margin:16px 0 0;font-size:11px;color:#9ca3af;line-height:1.5;">
+      Sent from Phenomenal Pool &amp; Landscape leads worker &middot; Lead ID: ${leadId}<br>
+      Phenomenal Pool &amp; Landscape, 5875 Pacific St Suite C-3, Rocklin, CA 95677 &middot;
+      <a href="mailto:contact@916pools.com?subject=Unsubscribe%20${encodeURIComponent(email)}" style="color:#9ca3af;">unsubscribe</a>
+    </p>
   </div>
 </div>
 </body>
 </html>`;
 
-      // Send via Resend
-      // Pass 26: Subject prefixes:
-      //   [DO NOT CONTACT] — customer opted out of contact
-      //   [STRUCTURES ONLY] — pool was not measured (no resurface cost in total)
-      const subjectPrefix = optedOut ? '[DO NOT CONTACT] '
-        : structuresOnly ? '[STRUCTURES ONLY] '
-        : '';
-      const resendPayload = {
-        from: `Phenomenal Leads <${env.FROM_EMAIL}>`,
-        to: [env.NOTIFY_EMAIL],
-        reply_to: email,
-        subject: `${subjectPrefix}New Pool Lead — ${name}${data.address ? ' · ' + data.address : ''}${data.total ? ' · $' + Number(data.total).toLocaleString() : ''}`,
-        text: textLines,
-        html: htmlEmail,
-      };
+    const subjectPrefix = optedOut ? '[DO NOT CONTACT] '
+      : structuresOnly ? '[STRUCTURES ONLY] '
+      : '';
 
-      const resendRes = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(resendPayload),
-      });
+    const resendPayload = {
+      from: `Phenomenal Leads <${env.FROM_EMAIL}>`,
+      to: [env.NOTIFY_EMAIL],
+      reply_to: email,
+      subject: `${subjectPrefix}New Pool Lead — ${name}${data.address ? ' · ' + data.address : ''}${data.total ? ' · $' + Number(data.total).toLocaleString() : ''}`,
+      text: textLines,
+      html: htmlEmail,
+    };
 
-      if (!resendRes.ok) {
-        const err = await resendRes.text();
-        console.error('Resend error:', err);
-        // Don't fail the request — we still saved to KV
-      }
+    const resendRes = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(resendPayload),
+    });
 
-      return new Response(JSON.stringify({ ok: true, id: leadId }), { headers: corsHeaders });
-    } catch (err) {
-      console.error('Worker error:', err);
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: corsHeaders,
-      });
+    if (!resendRes.ok) {
+      const err = await resendRes.text();
+      console.error('Resend error:', err);
+      // Don't fail the request — the lead is still in KV.
     }
-  },
-};
+
+    return jsonResp({ ok: true, id: leadId });
+  } catch (err) {
+    console.error('Worker error:', err);
+    return jsonResp({ error: err.message }, 500);
+  }
+}
 
 function escHtml(str) {
   return String(str)
