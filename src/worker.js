@@ -204,6 +204,9 @@ const CSV_COLUMNS = [
   'pool_finish', 'concrete_finish', 'timeline',
   'contact_methods', 'contact_time',
   'source', 'page', 'notes',
+  // Pass 31: acquisition / attribution tracking
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+  'gclid', 'fbclid', 'referrer', 'landing_page',
   'contacted', 'contacted_at', 'contact_note',
 ];
 
@@ -290,6 +293,22 @@ async function handleLeadIntake(request, env) {
     const designImage = (data.designImage || '').toString().trim();
     const hasDesignImage = designImage.startsWith('data:image/');
 
+    // Pass 31: project field — landing forms post `project_type`, design
+    // studio posts `project`. Accept either; prefer the more specific one.
+    const projectField = data.project || data.project_type || null;
+
+    // Pass 31: acquisition attribution fields. Forms now inject these as
+    // hidden inputs (lead-attribution.js). All optional, all string-safe.
+    const utm_source   = (data.utm_source   || '').toString().trim() || null;
+    const utm_medium   = (data.utm_medium   || '').toString().trim() || null;
+    const utm_campaign = (data.utm_campaign || '').toString().trim() || null;
+    const utm_term     = (data.utm_term     || '').toString().trim() || null;
+    const utm_content  = (data.utm_content  || '').toString().trim() || null;
+    const gclid        = (data.gclid        || '').toString().trim() || null;
+    const fbclid       = (data.fbclid       || '').toString().trim() || null;
+    const referrer     = (data.referrer     || '').toString().trim() || null;
+    const landing_page = (data.landing_page || '').toString().trim() || null;
+
     const leadId = crypto.randomUUID();
     const timestamp = new Date().toISOString();
     const leadRecord = {
@@ -299,7 +318,7 @@ async function handleLeadIntake(request, env) {
       source: data._source || data.source || 'website',
       page: data.page || null,
       address: data.address || null,
-      project: data.project || null,
+      project: projectField,
       project_slug: data.project_slug || null,
       template: data.template || null,
       size: data.size || null,
@@ -313,6 +332,9 @@ async function handleLeadIntake(request, env) {
       contact_time: data.contact_time || null,
       notes: data.notes || data.description || data.message || null,
       has_design_image: hasDesignImage,
+      // Pass 31: acquisition attribution
+      utm_source, utm_medium, utm_campaign, utm_term, utm_content,
+      gclid, fbclid, referrer, landing_page,
       userAgent: request.headers.get('user-agent'),
       ip: request.headers.get('cf-connecting-ip'),
       submitted_at: data.submitted_at || timestamp,
@@ -352,7 +374,7 @@ async function handleLeadIntake(request, env) {
       ['Address', data.address],
       ['Preferred Contact', fmtContactMethods(cmRaw)],
       ['Best Time to Reach', fmtContactTime(data.contact_time)],
-      ['Project', data.project],
+      ['Project', projectField],
       ['Template', data.template],
       ['Size', data.size],
       ['Zones', data.zones_summary],
@@ -364,6 +386,17 @@ async function handleLeadIntake(request, env) {
       ['Notes', leadRecord.notes],
       ['Source', data.source],
       ['Page', data.page],
+      // Pass 31: acquisition attribution surfaced in the email so you can
+      // see at a glance whether the lead came from Google Ads, organic, etc.
+      ['UTM Source', utm_source],
+      ['UTM Medium', utm_medium],
+      ['UTM Campaign', utm_campaign],
+      ['UTM Term', utm_term],
+      ['UTM Content', utm_content],
+      ['Google Click ID', gclid],
+      ['Facebook Click ID', fbclid],
+      ['Referrer', referrer],
+      ['Landing Page', landing_page],
       ['Received', timestamp],
       ['Lead ID', leadId],
     ].filter(([, v]) => v);
