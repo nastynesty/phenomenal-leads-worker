@@ -3,7 +3,7 @@
 // wrangler secret). The lead intake POST behavior is unchanged.
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -48,7 +48,7 @@ export default {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    return await handleLeadIntake(request, env);
+    return await handleLeadIntake(request, env, ctx);
   },
 };
 
@@ -252,7 +252,7 @@ async function handleExportCsv(env) {
 
 // --- public: lead intake (unchanged behavior, refactored into a function) --
 
-async function handleLeadIntake(request, env) {
+async function handleLeadIntake(request, env, ctx) {
   try {
     const contentType = request.headers.get('content-type') || '';
     let data = {};
@@ -480,6 +480,43 @@ async function handleLeadIntake(request, env) {
       const err = await resendRes.text();
       console.error('Resend error:', err);
       // Don't fail the request — the lead is still in KV.
+    }
+
+    // Pass 32: fan out to the Phenomenal Pool Tracker app so this lead lands
+    // directly in the Jobs pipeline (status=Lead) and admins get a push
+    // notification. Fire-and-forget — if the app is down the lead is still in
+    // KV + email, so we never break the customer's submit.
+    try {
+      const appUrl = env.APP_LEADS_URL || 'https://app.phenomenalpoolscapes.com/api/leads/inbound';
+      const appPayload = {
+        name,
+        email,
+        phone,
+        address: data.address || null,
+        message: data.notes || data.description || data.message || null,
+        projectType: projectField || data.template || null,
+        source: leadRecord.source || 'website',
+      };
+      // Use ctx.waitUntil so the worker keeps the fetch alive after we return
+      // the response. Without this the runtime may cancel the in-flight fetch.
+      const fanOut = fetch(appUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(appPayload),
+      }).then(async (r) => {
+        if (!r.ok) {
+          const t = await r.text().catch(() => '');
+          console.error('[app fan-out] non-ok status=' + r.status + ' body=' + t.slice(0, 200));
+        }
+      }).catch((e) => console.error('[app fan-out] failed:', e && e.message));
+      if (ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(fanOut);
+      } else {
+        // Fallback when no ctx is available — await so we don't drop the request.
+        await fanOut;
+      }
+    } catch (e) {
+      console.error('[app fan-out] threw:', e && e.message);
     }
 
     return jsonResp({ ok: true, id: leadId });
