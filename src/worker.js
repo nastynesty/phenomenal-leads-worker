@@ -204,10 +204,12 @@ const CSV_COLUMNS = [
   'pool_finish', 'concrete_finish', 'timeline',
   'contact_methods', 'contact_time',
   'source', 'page', 'notes',
+  // Pass 38AB: shareable view-design link (built client-side via buildShareUrl).
+  'share_url',
   // Pass 31: acquisition / attribution tracking
   'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
   'gclid', 'fbclid', 'referrer', 'landing_page',
-  'contacted', 'contacted_at', 'contact_note',
+  'ip', 'contacted', 'contacted_at', 'contact_note',
 ];
 
 function csvEscape(v) {
@@ -293,6 +295,13 @@ async function handleLeadIntake(request, env, ctx) {
     const designImage = (data.designImage || '').toString().trim();
     const hasDesignImage = designImage.startsWith('data:image/');
 
+    // Pass 38AB — share URL lets the team open a full interactive copy of
+    // the customer's design (same link the customer would share with family).
+    const shareUrlRaw = (data.share_url || data.shareUrl || '').toString().trim();
+    // Defensive: only keep https URLs to our own domain to avoid open-redirect
+    // surprises in our team inbox.
+    const shareUrl = /^https:\/\/[^\s]+$/i.test(shareUrlRaw) ? shareUrlRaw : null;
+
     // Pass 31: project field — landing forms post `project_type`, design
     // studio posts `project`. Accept either; prefer the more specific one.
     const projectField = data.project || data.project_type || null;
@@ -332,6 +341,7 @@ async function handleLeadIntake(request, env, ctx) {
       contact_time: data.contact_time || null,
       notes: data.notes || data.description || data.message || null,
       has_design_image: hasDesignImage,
+      share_url: shareUrl,
       // Pass 31: acquisition attribution
       utm_source, utm_medium, utm_campaign, utm_term, utm_content,
       gclid, fbclid, referrer, landing_page,
@@ -386,6 +396,7 @@ async function handleLeadIntake(request, env, ctx) {
       ['Notes', leadRecord.notes],
       ['Source', data.source],
       ['Page', data.page],
+      ['IP', leadRecord.ip],
       // Pass 31: acquisition attribution surfaced in the email so you can
       // see at a glance whether the lead came from Google Ads, organic, etc.
       ['UTM Source', utm_source],
@@ -427,6 +438,15 @@ async function handleLeadIntake(request, env, ctx) {
       ? `<div style="margin:20px 0;"><p style="margin:0 0 8px;font-size:13px;font-weight:600;color:#374151;">DESIGN SCREENSHOT</p><img src="${designImage}" alt="Customer design" style="max-width:100%;border-radius:8px;border:1px solid #e5e7eb;" /></div>`
       : '';
 
+    // Pass 38AB — prominent "Open the design" CTA + a plain-text fallback URL.
+    const shareBlock = shareUrl
+      ? `<div style="margin:20px 0;padding:18px 20px;background:#f1f5ff;border:1px solid #c7d2fe;border-radius:10px;">
+          <div style="font-size:12px;color:#3730a3;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:8px;">Open the customer's design</div>
+          <a href="${escHtml(shareUrl)}" style="display:inline-block;background:#0071e3;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:10px 18px;border-radius:999px;">View interactive design →</a>
+          <div style="margin-top:10px;font-size:11px;color:#4b5563;word-break:break-all;">${escHtml(shareUrl)}</div>
+        </div>`
+      : '';
+
     const htmlEmail = `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -443,6 +463,7 @@ async function handleLeadIntake(request, env, ctx) {
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       ${tableRows}
     </table>
+    ${shareBlock}
     ${imageBlock}
     <p style="margin:16px 0 0;font-size:11px;color:#9ca3af;line-height:1.5;">
       Sent from Phenomenal Pool &amp; Landscape leads worker &middot; Lead ID: ${leadId}<br>
