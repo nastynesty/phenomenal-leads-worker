@@ -1,6 +1,16 @@
 // Pass 29 D — added admin endpoints (/admin/leads, /admin/leads/:id/mark,
 // /admin/leads/export.csv) protected by a shared bearer token (ADMIN_TOKEN
 // wrangler secret). The lead intake POST behavior is unchanged.
+//
+// Pass 39 — bulletproof fan-out to the Pool Tracker app:
+//   * Every fan-out attempt persists a `fanout:pending:<id>` KV row BEFORE the
+//     POST so we never lose a lead even if the runtime kills our waitUntil.
+//   * 3 retries with exponential backoff inside the same request.
+//   * On final failure the row stays as `fanout:failed:<id>` for replay.
+//   * New admin endpoints: GET /admin/fanouts (list pending+failed),
+//     POST /admin/fanouts/replay (retry every failed lead).
+//   * Pool Tracker's hourly cron is expected to hit /admin/fanouts/replay so
+//     even a multi-hour app outage self-heals automatically.
 
 export default {
   async fetch(request, env, ctx) {
@@ -40,6 +50,19 @@ export default {
         return await handleLeadDetail(detailMatch[1], env);
       }
 
+      return jsonResp({ error: 'Not found' }, 404);
+    }
+
+    // Pass 39 — fan-out admin/replay endpoints (also bearer-protected).
+    if (path.startsWith('/admin/fanouts')) {
+      const auth = checkAdminAuth(request, env);
+      if (auth !== true) return auth;
+      if (path === '/admin/fanouts' && method === 'GET') {
+        return await handleListFanouts(env);
+      }
+      if (path === '/admin/fanouts/replay' && method === 'POST') {
+        return await handleReplayFanouts(env, ctx);
+      }
       return jsonResp({ error: 'Not found' }, 404);
     }
 
@@ -503,41 +526,40 @@ async function handleLeadIntake(request, env, ctx) {
       // Don't fail the request — the lead is still in KV.
     }
 
-    // Pass 32: fan out to the Phenomenal Pool Tracker app so this lead lands
-    // directly in the Jobs pipeline (status=Lead) and admins get a push
-    // notification. Fire-and-forget — if the app is down the lead is still in
-    // KV + email, so we never break the customer's submit.
+    // Pass 39 — bulletproof fan-out to the Pool Tracker app.
+    //
+    // The lead is already safe in KV + email at this point. We now attempt a
+    // POST to /api/leads/inbound, but we ALWAYS persist the intent to KV first
+    // so a Pool Tracker outage (or a runtime that kills waitUntil) never makes
+    // a lead vanish from the tool — it just stays as `fanout:failed:*` for
+    // replay by the next cron tick.
+    const appPayload = {
+      name,
+      email,
+      phone,
+      address: data.address || null,
+      message: data.notes || data.description || data.message || null,
+      projectType: projectField || data.template || null,
+      source: leadRecord.source || 'website',
+      // Pass 39: pass external_id so Pool Tracker can dedupe on replays.
+      external_id: leadId,
+    };
     try {
-      const appUrl = env.APP_LEADS_URL || 'https://app.phenomenalpoolscapes.com/api/leads/inbound';
-      const appPayload = {
-        name,
-        email,
-        phone,
-        address: data.address || null,
-        message: data.notes || data.description || data.message || null,
-        projectType: projectField || data.template || null,
-        source: leadRecord.source || 'website',
-      };
-      // Use ctx.waitUntil so the worker keeps the fetch alive after we return
-      // the response. Without this the runtime may cancel the in-flight fetch.
-      const fanOut = fetch(appUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(appPayload),
-      }).then(async (r) => {
-        if (!r.ok) {
-          const t = await r.text().catch(() => '');
-          console.error('[app fan-out] non-ok status=' + r.status + ' body=' + t.slice(0, 200));
-        }
-      }).catch((e) => console.error('[app fan-out] failed:', e && e.message));
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(fanOut);
-      } else {
-        // Fallback when no ctx is available — await so we don't drop the request.
-        await fanOut;
-      }
+      // Persist BEFORE attempting so we know about the lead even if we crash.
+      await env.LEADS.put(`fanout:pending:${leadId}`, JSON.stringify({
+        id: leadId,
+        timestamp,
+        payload: appPayload,
+        attempts: 0,
+      }));
     } catch (e) {
-      console.error('[app fan-out] threw:', e && e.message);
+      console.error('[fan-out] failed to persist pending row:', e && e.message);
+    }
+    const fanOutTask = attemptFanOut(env, leadId, appPayload, 0);
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(fanOutTask);
+    } else {
+      await fanOutTask;
     }
 
     return jsonResp({ ok: true, id: leadId });
@@ -545,6 +567,102 @@ async function handleLeadIntake(request, env, ctx) {
     console.error('Worker error:', err);
     return jsonResp({ error: err.message }, 500);
   }
+}
+
+// --- Pass 39: bulletproof fan-out helpers ---------------------------------
+
+async function attemptFanOut(env, leadId, payload, priorAttempts) {
+  const appUrl = env.APP_LEADS_URL || 'https://app.phenomenalpoolscapes.com/api/leads/inbound';
+  const maxAttempts = 3;
+  let attempts = priorAttempts || 0;
+  let lastErr = null;
+  for (let i = 0; i < maxAttempts; i++) {
+    attempts++;
+    try {
+      const r = await fetch(appUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        // Success — clean up.
+        try { await env.LEADS.delete(`fanout:pending:${leadId}`); } catch (_) {}
+        try { await env.LEADS.delete(`fanout:failed:${leadId}`); } catch (_) {}
+        return { ok: true, attempts };
+      }
+      const body = await r.text().catch(() => '');
+      lastErr = `status=${r.status} body=${body.slice(0, 200)}`;
+      console.error(`[fan-out] attempt ${attempts} non-ok: ${lastErr}`);
+    } catch (e) {
+      lastErr = (e && e.message) || String(e);
+      console.error(`[fan-out] attempt ${attempts} threw: ${lastErr}`);
+    }
+    // Exponential backoff: 250ms, 1s — but only if we'll retry.
+    if (i < maxAttempts - 1) {
+      const waitMs = 250 * Math.pow(4, i);
+      await new Promise((res) => setTimeout(res, waitMs));
+    }
+  }
+  // Final failure — persist as failed for replay.
+  try {
+    const pendingRaw = await env.LEADS.get(`fanout:pending:${leadId}`);
+    let rec = pendingRaw ? JSON.parse(pendingRaw) : { id: leadId, payload };
+    rec.attempts = attempts;
+    rec.last_error = lastErr;
+    rec.last_attempt_at = new Date().toISOString();
+    await env.LEADS.put(`fanout:failed:${leadId}`, JSON.stringify(rec));
+    await env.LEADS.delete(`fanout:pending:${leadId}`);
+  } catch (e) {
+    console.error('[fan-out] failed to persist failure row:', e && e.message);
+  }
+  return { ok: false, attempts, error: lastErr };
+}
+
+async function handleListFanouts(env) {
+  const out = { pending: [], failed: [] };
+  for (const prefix of ['fanout:pending:', 'fanout:failed:']) {
+    const listed = await env.LEADS.list({ prefix, limit: 1000 });
+    for (const k of listed.keys) {
+      const raw = await env.LEADS.get(k.name);
+      if (!raw) continue;
+      try {
+        const rec = JSON.parse(raw);
+        if (prefix === 'fanout:pending:') out.pending.push(rec);
+        else out.failed.push(rec);
+      } catch (_) {}
+    }
+  }
+  return jsonResp({ ok: true, pending_count: out.pending.length, failed_count: out.failed.length, ...out });
+}
+
+async function handleReplayFanouts(env, ctx) {
+  const targets = [];
+  for (const prefix of ['fanout:failed:', 'fanout:pending:']) {
+    const listed = await env.LEADS.list({ prefix, limit: 1000 });
+    for (const k of listed.keys) {
+      const raw = await env.LEADS.get(k.name);
+      if (!raw) continue;
+      try {
+        const rec = JSON.parse(raw);
+        if (rec && rec.id && rec.payload) targets.push(rec);
+      } catch (_) {}
+    }
+  }
+  // Cap per-call so a huge backlog doesn't time out the request.
+  const slice = targets.slice(0, 50);
+  const results = [];
+  for (const rec of slice) {
+    const r = await attemptFanOut(env, rec.id, rec.payload, rec.attempts || 0);
+    results.push({ id: rec.id, ok: r.ok, attempts: r.attempts, error: r.error || null });
+  }
+  return jsonResp({
+    ok: true,
+    replayed: results.length,
+    succeeded: results.filter((r) => r.ok).length,
+    failed: results.filter((r) => !r.ok).length,
+    backlog_remaining: Math.max(0, targets.length - slice.length),
+    results,
+  });
 }
 
 function escHtml(str) {
